@@ -1,0 +1,6 @@
+https://github.com/tseemann/prokka 
+https://github.com/oschwengers/bakta
+https://github.com/tmehta12/LIFE748-genomeassembly-annotation/blob/main/Assembly_WS.md
+
+R Packages used for Question 2:
+DESeq2, EnhancedVolcano, pheatmap, caret, MASS, e1071, ggplot2, pROC, pls, mixomics and dplyr.
