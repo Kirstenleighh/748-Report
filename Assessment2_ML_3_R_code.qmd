@@ -1,0 +1,552 @@
+---
+title: "LIFE748 - ML and data analysis"
+author: "Kirsten Leigh Nutter"
+format: html
+editor: visual
+---
+
+```{# AI Declaration statement: I used GenAI tools in the preparation of this work}
+  
+# Claude v4.6	
+# I used Claude for part 2 analysis only, to aid with the code for steps 6, 7 and 8 of the R .qmd file. Specifically, I used it for ROC curve to compare svm kernel performance, pls-da analysis (not included in final report), and cross validation to implement a k-fold cross validation approach to compare across random splits. I have rewritten the code that was provided in responses out myself as not all of it was necessary, I have added parts/taken parts of code out to align with the aims of the specific steps. Please see prompt/response file for more information on use for each step.
+
+```
+
+## Introduction
+
+In this tutorial, we will analyze a simulated RNA-seq dataset. Our goal is to identify Differentially Expressed Genes (DEGs) between two conditions (Condition A and Condition B), visualize the results, and use both unsupervised and supervised machine learning techniques to classify the samples based on their gene expression profiles.
+
+## Step 0: Load the required libraries
+
+```{r warning=FALSE, message=FALSE }
+
+# Install BiocManager
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = "3.22")
+
+BiocManager::install(c("S4Vectors", "IRanges", "SummarizedExperiment", "GenomicRanges"))
+
+# Install BiocManager packages
+BiocManager::install(c("DESeq2", "EnhancedVolcano", "pheatmap"), ask = FALSE, update = TRUE)
+
+# Install CRAN packages
+install.packages(c("ggplot2", "caret", "MASS", "e1071"))
+
+# Load libraries 
+library(DESeq2) # Bioconductor
+library(ggplot2) # CRAN
+library(EnhancedVolcano) # Bioconductor
+library(pheatmap) # Bioconductor
+library(caret) # CRAN
+library(MASS) # CRAN
+library(e1071) # CRAN
+
+```
+
+If these packages are not already available, you will need to install them either from CRAN (install.packages('package_name')), or from Bioconductor (BiocManager::install('package_name')
+
+## Step 1: Load the Count Matrix
+
+First, we load the raw count matrix and set up the sample metadata (phenotype data). We assume the first 25 columns belong to Condition A, and the next 25 belong to Condition B.
+
+```{r}
+counts <- read.csv("dataset_LIFE748_3.csv", row.names = 1)
+
+colData <- data.frame(
+  row.names = colnames(counts),
+  Condition = c(rep('CondA',25),rep('CondB',25))
+)
+
+```
+
+## Step 2: Normalize and Identify DEGs with DESeq2
+
+We will use `DESeq2` to normalize the library sizes and perform statistical testing to identify which genes are differentially expressed between Condition B and Condition A.
+
+```{r}
+# Create DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = colData,
+                              design = ~ Condition)
+
+# Run DESeq2 pipeline
+dds <- DESeq(dds)
+
+# Extract the results (Condition B vs Condition A)
+res <- results(dds)
+
+# Convert object into a dataframe
+res <- as.data.frame(res)
+
+# Extract normalised counts for downstream machine learning
+vsd <- vst(dds, blind = FALSE) # Variance stabilising transformation
+normalized_counts <- assay(vsd)
+
+```
+
+## Step 3: Report DEGs (Table and Volcano Plot)
+
+We define statistically significant DEGs as those with an adjusted p-value (FDR) \< 0.05 and an absolute log2 Fold Change \> 1.
+
+```{r}
+
+# Filtering for significant DEGs, those with FDR < 0.05 and absolute log2FC > 1
+sigDEGs <- res[which(res$padj < 0.05 & abs(res$log2FoldChange) > 1), ]
+
+# Order by adjusted p-value
+sigDEGs <- sigDEGs[order(sigDEGs$padj), ]
+
+# Summary counts
+cat("Total DEGs:", nrow(sigDEGs), "\n")
+cat("Upregulated (log2FC > 1):", sum(sigDEGs$log2FoldChange > 1), "\n")
+cat("Downregulated (log2FC < -1):", sum(sigDEGs$log2FoldChange < -1), "\n")
+
+# Top 20 DEGs
+head(sigDEGs[, c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")], 20)
+
+# baseMean = How highly expressed the gene is
+# log2FoldChange = How much it changes between conditions
+# lfcSE = How confident DESeq2 is in that change, standard error
+# stat = FC divided by its uncertainty (signal/noise)
+
+write.csv(sigDEGs, "DEGs_significant.csv")
+
+```
+
+Generate a volcano plot to visualise the results
+
+```{r fig.width=12, fig.height=11}
+
+EnhancedVolcano(res,
+  lab        = rownames(res),                 # gene labels
+  x          = 'log2FoldChange',              # x-axis
+  y          = 'padj',                        # y-axis (FDR-adjusted p-value)
+  title      = 'Condition A vs Condition B',
+  subtitle   = 'FDR < 0.05, log2FC > 1',
+  pCutoff    = 0.05,                          # horizontal threshold line
+  FCcutoff   = 1.0,                           # vertical threshold lines
+  pointSize  = 3,
+  labSize    = 3.5,
+  col        = c('red',                       # Not significant
+                 'palevioletred',             # FC only
+                 'orange',                    # p-value only
+                 'green'),                    # significant both fc and p val
+  colAlpha   = 0.6,
+  legendPosition = 'right',
+  widthConnectors = 0.4,
+  max.overlaps = 100                    
+)
+
+```
+
+## Step 4: Isolate Differentially Expressed Genes
+
+To reduce noise and dimensionality for our machine learning algorithms, we will subset our normalized count matrix to only include the statistically significant DEGs identified above.
+
+In order to make sure we don't lose too much information, let's relax a bit the thresholds for significance
+
+```{r}
+
+# Relaxed thresholds: FDR < 0.1 and |log2FC| > 0.5
+degs_relaxed <- res[which(res$padj < 0.1 & abs(res$log2FoldChange) > 0.5), ]
+
+cat("DEGs with strict thresholds (FDR<0.05, |FC|>1):", 
+    nrow(res[which(res$padj < 0.05 & abs(res$log2FoldChange) > 1), ]), "\n")
+cat("DEGs with relaxed thresholds (FDR<0.1, |FC|>0.5):", 
+    nrow(degs_relaxed), "\n")
+
+
+# Subset gene names from relaxed DEG list
+deg_genes <- rownames(degs_relaxed)
+
+# Subset the VST-normalised matrix to only the DEG features
+ml_matrix <- normalized_counts[deg_genes, ]
+
+dim(ml_matrix)
+
+ml_matrix[1:5, 1:5]
+
+
+
+# Transpose to make rows = samples and columns = genes
+ml_data <- as.data.frame(t(ml_matrix))
+
+deg_counts_scaled <- scale(ml_data)
+
+# Add condition labels as the target variable
+ml_data$Condition <- colData$Condition
+
+dim(ml_data)        
+table(ml_data$Condition)  
+
+# Condition to a factor
+ml_data$Condition <- as.factor(ml_data$Condition)
+
+```
+
+## Step 5: Unsupervised Clustering
+
+Let's see if the samples naturally group by their condition without explicitly telling the algorithm which sample belongs to which group. We will use Hierarchical Clustering and K-means.
+
+## k-means
+
+```{r}
+
+df <- ml_data[, !colnames(ml_data) %in% "Condition"]
+df_scaled <- as.data.frame(scale(df))
+
+
+set.seed(123)
+out <- kmeans(df_scaled, centers = 2, iter.max = 15, nstart=5) 
+out
+
+# % needs to be above 60% (change center number until this has been reached) 
+
+df_scaled$clusters <- as.factor(out$cluster)
+df_scaled$Condition <- ml_data$Condition
+
+pca <- prcomp(df_scaled[, !colnames(df_scaled) %in% c("clusters","Condition")])
+plot_df <- data.frame(
+  PC1       = pca$x[,1],
+  PC2       = pca$x[,2],
+  Cluster   = df_scaled$clusters,
+  Condition = df_scaled$Condition
+)
+
+
+ggplot(plot_df, aes(x=PC1, y=PC2))+
+  geom_point(aes(col=Cluster))+
+  theme(panel.background = element_rect(fill = "white",colour = "black", 
+                                        linewidth = 1,linetype = "solid"),
+        panel.grid.major = element_blank(),panel.grid.minor = element_blank(),
+        text = element_text(size=20,colour = "black",face = "bold"),
+        legend.key=element_blank())+
+  ggtitle("K-means clusters vs true conditions")
+
+
+# Elbow test
+
+gene_cols <- !colnames(df_scaled) %in% c("clusters", "Condition")
+
+k.max <- 10
+wss <- sapply(1:k.max, 
+              function(k){kmeans(df_scaled[, gene_cols], k, nstart=5, iter.max = 15 )$tot.withinss})
+plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+abline(v = 2, lty = 2, col = "palevioletred")
+
+# further clustering is needed to show how similar each data point is to the others - hierarchical clustering for a dendrogram, this doesnt give you clusters but it is more adpatable than k-means by giving the relationship between the points (distance matrix)
+```
+
+## Hierarchical Clustering
+
+```{r}
+dist_mat <- dist(df_scaled[, gene_cols], method = "euclidean")
+
+
+hc_average<- hclust(dist_mat, method = 'average')
+plot(hc_average)
+#rect.hclust(hc_average, h = 1.3, border = 2:6)
+rect.hclust(hc_average, k = 2, border = 2:6)  
+abline(h = 1.3, col = 'palevioletred')
+
+```
+
+Visualise the results (HINT: an heatmap would be perfect for this).
+
+```{r}
+set.seed(123)
+
+km <- kmeans(deg_counts_scaled, centers = 2, nstart = 25)
+
+km$cluster
+
+table(Cluster = km$cluster, Condition = colData$Condition)
+```
+
+```{r}
+
+annotation_col <- data.frame(Cluster = as.factor(km$cluster), Condition = colData$Condition)
+rownames(annotation_col) <- rownames(colData)                             
+
+# Heatmap of DEGs (all samples)
+library(pheatmap)
+pheatmap(t(scale(t(ml_matrix))),
+         annotation_col = annotation_col, 
+         show_rownames = FALSE,
+         main = "Heatmap of DEGs")
+
+```
+
+## Step 6: Supervised Learning (LDA and SVM)
+
+Next, we train classifiers to predict the condition of a sample based on its DEG expression profile. We will split the data into a training set (70%) and a testing set (30%).
+
+```{r}
+ml_data <- as.data.frame(t(ml_matrix))
+ml_data$Condition <- as.factor(colData$Condition)
+dim(ml_data)
+table(ml_data$Condition)
+
+set.seed(122)
+trainIndex <- createDataPartition(ml_data$Condition,p=0.7, list=FALSE,times=1)
+df_train <- ml_data[trainIndex,] 
+df_validate <- ml_data[-trainIndex,]
+```
+
+Train LDA (Linear Discriminant Analysis)
+
+```{r}
+model_LDA <- lda(Condition ~., data = df_train)
+model_LDA
+
+plot(model_LDA)
+
+#p = [x1, y1]
+
+# each point equi-distant from the centroid 
+# becomes ellipsis shape of clusters (x and y)
+# line between the two is the LDA line
+# to discover linear combinations of given features 
+# maximises seperation between classes and minimises variance within classes
+
+
+pred <- predict(model_LDA, newdata=df_validate)
+CM = confusionMatrix(data=as.factor(pred$class), as.factor(df_validate$Condition))
+CM
+```
+
+Train SVM (Support Vector Machine)
+
+```{r}
+df_train$Condition <- as.factor(df_train$Condition)
+df_validate$Condition <- factor(df_validate$Condition, levels = levels(df_train$Condition))
+
+model_SVM <- svm(Condition ~ ., data=df_train)
+summary(model_SVM)
+
+
+pred <- predict(model_SVM, newdata=df_validate)
+
+CM <- confusionMatrix(data = pred, reference = df_validate$Condition)
+CM
+
+#CM = confusionMatrix(data=as.factor(pred), as.factor(df_validate$Condition))
+#CM
+
+# svm is used if an lda line cannot be plotted e.g. if x points are surround by y in a circle (no clear seperation)
+
+# svm enables us to plot the points using a different kernel (shape) to visualise the variance when plotted on a 2d graph, points are plotted on each side of optimal hyperplane.
+
+# Kernels calculate similarity of pairs of data points
+
+# Work out which kernel to use :
+
+#LINEAR 
+df_train$Condition <- as.factor(df_train$Condition)
+model_SVM <- svm(Condition ~ ., data=df_train,kernel='linear')
+
+pred <- predict(model_SVM, newdata=df_validate,type="class")
+CM = confusionMatrix(data=as.factor(pred), as.factor(df_validate$Condition))
+CM
+
+#POLYNOMIAL
+df_train$Condition <- as.factor(df_train$Condition)
+model_SVM <- svm(Condition ~ ., data=df_train,kernel='polynomial')
+
+pred <- predict(model_SVM, newdata=df_validate,type="class")
+CM = confusionMatrix(data=as.factor(pred), as.factor(df_validate$Condition))
+CM
+
+#SIGMOID
+df_train$Condition <- as.factor(df_train$Condition)
+model_SVM <- svm(Condition ~ ., data=df_train,kernel='sigmoid')
+
+pred <- predict(model_SVM, newdata=df_validate,type="class")
+CM = confusionMatrix(data=as.factor(pred), as.factor(df_validate$Condition))
+CM
+
+
+# Acc > NIR P value should be < 0.05
+# Mcnemars P value should be > 0.05
+
+# linear P-Value [Acc > NIR] : 0.00647 - yes 
+# linear Mcnemar's Test P-Value : 0.47950 - yes
+
+# Polynomial P-Value [Acc > NIR] : 0.21198 - no, is not less than 0.05        
+# Polynomial Mcnemar's Test P-Value : 0.07364 - yes
+
+# Sigmoid P-Value [Acc > NIR] : 0.0009155 - yes
+# Sigmoid Mcnemar's Test P-Value : 1.0000000 - yes
+
+
+# from these results alone, polynomial can be removed as it is not better for predictions/similarity of pairs of data points than the baseline model
+
+# between linear and sigmoid 
+# Sigmoid results are stronger 
+
+```
+
+```{r}
+# ROC curve plot to compare linear and sigmoid kernels for SVM 
+
+library(e1071)
+library(pROC)
+library(ggplot2)
+
+# Train both models with probability = TRUE
+model_linear  <- svm(Condition ~ ., data = df_train, kernel = "linear",  probability = TRUE)
+model_sigmoid <- svm(Condition ~ ., data = df_train, kernel = "sigmoid", probability = TRUE)
+
+# Get probabilities
+pred_linear  <- predict(model_linear,  newdata = df_validate, probability = TRUE)
+pred_sigmoid <- predict(model_sigmoid, newdata = df_validate, probability = TRUE)
+
+prob_linear  <- attr(pred_linear,  "probabilities")[, 2]
+prob_sigmoid <- attr(pred_sigmoid, "probabilities")[, 2]
+
+# ROC objects
+roc_linear  <- roc(df_validate$Condition, prob_linear)
+roc_sigmoid <- roc(df_validate$Condition, prob_sigmoid)
+
+# Plot
+ggroc(list(Linear = roc_linear, Sigmoid = roc_sigmoid), size = 1) +
+  labs(title = "ROC Curve: Linear vs Sigmoid SVM",
+       color = "Kernel") +
+  annotate("text", x = 0.5, y = 0.4,
+           label = paste("Linear AUC =",  round(auc(roc_linear),  3)), color = "palevioletred") +
+  annotate("text", x = 0.5, y = 0.3,
+           label = paste("Sigmoid AUC =", round(auc(roc_sigmoid), 3)), color = "steelblue") +
+  theme_minimal()
+
+# sigmoid has higher accuracy and kappa 
+# an auc score of 1 for sigmoid indicates that by using this kernel in the sv model offers better discrimination between condition a and condition b, and whenever it identfies one condition, it is 100% confident it is not the other 
+```
+
+## Step 7: Compare Classifier Performance
+
+Finally, we use confusion matrices to evaluate and compare how well LDA and SVM performed on the unseen test dataset.
+
+```{r}
+library(pls)
+library(caret)
+library(mixOmics)
+
+df_train$Condition <- as.factor(df_train$Condition)
+
+X <- apply(df_train[, -6], 2, as.numeric)
+X <- as.matrix(X)
+Y <- df_train$Condition
+
+model_PLSDA <- plsda(X, Y, ncomp=2) #cv=10)
+model_PLSDA
+
+scores <- model_PLSDA$variates$X
+
+plotdata <- data.frame(
+  Comp1 = scores[,1],
+  Comp2 = scores[,2],
+  class = Y
+)
+
+ggplot(plotdata, aes(Comp1, Comp2, col = class)) +
+  geom_point(size = 2) +
+  theme_minimal()+
+  scale_color_manual(values = c("steelblue", "palevioletred")) +
+  labs(title = "PLS-DA Score Plot", x = "Component 1", y = "Component 2")
+
+X_validate <- apply(df_validate[, -6], 2, as.numeric)
+X_validate <- as.matrix(X_validate)
+
+pred_PLSDA <- predict(model_PLSDA, X_validate, ncomp = 2)
+pred_class <- pred_class <- pred_PLSDA$class$max.dist[, 2]
+pred_factor <- factor(pred_class, labels = levels(df_train$Condition))
+
+cm_PLSDA <- confusionMatrix(pred_factor, df_validate$Condition)
+cm_PLSDA
+```
+
+## Step 8: Is this enough?
+
+Is this enough to compare the classifiers? What if you use a k-fold cross-validation approach? Will you get similar results with different random splits?
+
+This is not enough on its own to compare the classifiers as we have only tested on a single test and train. If a k-fold cross-validation approach was used, for example 5-fold, this would train on 4 folds and test on 1 to estimate how well each classifier performs on the unseen data to provide a better comparison. This would determine if performance results are stable across random splits.
+
+```{r}
+library(caret)
+library(dplyr)
+
+# defining a function for performance metrics for the models
+prediction_metrics <- function(pred, truth, model_name, positive = "CondB") {
+  cm1 <- confusionMatrix(pred, truth, positive = positive)# positive Condition B
+  data.frame(Model=model_name, # for each mdel, creates a dataframe with all performance metrics:
+             Accuracy = unname(cm1$overall["Accuracy"]), # overall accuracy measure
+             Kappa = unname(cm1$overall["Kappa"]),# verall Kappa 
+             Sensitivity = unname(cm1$byClass["Sensitivity"]), # metrics for class level 
+             Specificity = unname(cm1$byClass["Specificity"]),
+             Balanced_accuracy = unname(cm1$byClass["Balanced Accuracy"])
+  )
+}
+
+set.seed(140)
+
+folds <- createMultiFolds(ml_data$Condition, k = 5, times = 10) # 5 folds for each cross validation , which is then repeated 10 times 
+
+crossvalidation <- list() # list to store metrcis per fold in each of the models
+gene_log <- list() # list to store top selected genes for each of the folds
+
+for (i in seq_along(folds)) { # for loop to loop through each fold 
+  fold_train_index <- folds[[i]]
+  fold_train <- ml_data[fold_train_index, , drop = FALSE] # get the train set for each fold in turn
+  fold_test <- ml_data[-fold_train_index, , drop = FALSE] # get the test set for each fold in turn 
+  fold_x <- fold_train[, setdiff(colnames(fold_train), "Condition"), drop = FALSE]
+  fold_var <- sort(apply(fold_x, 2, var), decreasing = TRUE) # variance calculations using all columns except condition, for each feature in the training set
+  fold_var <- fold_var[fold_var > 0] # only look at features with variance
+  foldnfeatures <- min(10, length(fold_var)) # extracting top 10
+  fold_features <- intersect(names(fold_var)[1:foldnfeatures], colnames(fold_test)) # and ensure that these are present in the test set
+
+  gene_log[[i]] <- data.frame( # nsure that the features selected for each fold are recorded 
+  Resample = names(folds)[i],
+  Gene = fold_features
+  )
+  
+  fold_train_x <- scale(fold_train[, fold_features, drop = FALSE]) # scaling both test and train features in the same way, which will stop leakage
+  fold_centre <- attr(fold_train_x, "scaled:center")
+  fold_scale <- attr(fold_train_x, "scaled:scale")
+  fold_test_x <- scale(fold_test[, fold_features, drop = FALSE], 
+                       center = fold_centre,
+                       scale = fold_scale)
+  
+  fold_train_df <- data.frame(as.data.frame(fold_train_x), Condition = fold_train$Condition) # new dataframe that combines the scaled features into train and tst for modelling 
+  fold_test_df <- data.frame(as.data.frame(fold_test_x), Condition = fold_test$Condition)
+  
+  # LDA 
+  lda_cv_fit <- lda(Condition ~., data = fold_train_df)
+  lda_cv_pred <- predict(lda_cv_fit, newdata = fold_test_df)$class
+  
+  #SVM
+  svm_cv_fit <- svm(Condition ~., data = fold_train_df, kernel = "sigmoid", scale = FALSE)
+  svm_cv_pred <- predict(svm_cv_fit, newdata = fold_test_df)
+  
+  # cross val results 
+  crossvalidation[[length(crossvalidation) +1]] <- prediction_metrics(lda_cv_pred, fold_test_df$Condition, "LDA") 
+  crossvalidation[[length(crossvalidation) +1]] <- prediction_metrics(svm_cv_pred, fold_test_df$Condition, "SVM Sigmoid")
+}
+
+crossval_results_df <- bind_rows(crossvalidation) # performance metrics into one dataframe for plotting
+gene_df <- bind_rows(gene_log) # and the selected features/genes into df
+
+ggplot(crossval_results_df, aes(x=Model, y=Accuracy)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Classifier Type", y = "Accuracy")
+  
+
+# assumptions vary between LDA and SVM, svm is presenting as more accuracte (using sigmoid kernel), it is less sensitive to changes in the training set, it will give a more accurte result with the small number of samples compared to LDA
+# sigmoid svm rather than linear svm
+# svm uses scaling and overfitting is less likely 
+```
